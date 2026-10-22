@@ -19,6 +19,7 @@ import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
 import android.graphics.drawable.LayerDrawable;
+import android.graphics.drawable.TransitionDrawable;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
@@ -29,6 +30,8 @@ import android.net.NetworkRequest;
 import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -50,6 +53,8 @@ import java.io.File;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.TreeMap;
 import java.util.List;
 
@@ -97,6 +102,11 @@ public class MainActivity extends Activity {
     private static Typeface regular, semibold;
 
     private FrameLayout root; // the page, inside a vertical scroller
+    private ImageView wash;   // behind the page: a glow in the focused app's main colour
+    private String washKey;   // the app it shows, or is about to
+    private Drawable washNow, washNext;
+    private final Map<String, Drawable> washes = new HashMap<>();
+    private final Handler handler = new Handler(Looper.getMainLooper());
     private int tileW, tileH, gridTop; // app grid geometry, set by buildTiles
     private final List<View> tiles = new ArrayList<>();
     private boolean dirty = true;
@@ -131,6 +141,16 @@ public class MainActivity extends Activity {
         scale = getResources().getDisplayMetrics().widthPixels / 1920f;
         getWindow().setBackgroundDrawable(background());
 
+        // The glow sits behind the page and stays put; a scrim darkens it towards the apps.
+        FrameLayout stage = new FrameLayout(this);
+        wash = new ImageView(this);
+        wash.setScaleType(ImageView.ScaleType.FIT_XY);
+        stage.addView(wash, new FrameLayout.LayoutParams(-1, -1));
+        View scrim = new View(this);
+        scrim.setBackground(new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[] {0x26050405, 0x0D050405, 0x99050405, 0xE6050405}));
+        stage.addView(scrim, new FrameLayout.LayoutParams(-1, -1));
+
         ScrollView scroller = new ScrollView(this);
         scroller.setFillViewport(true);
         scroller.setVerticalScrollBarEnabled(false);
@@ -158,7 +178,8 @@ public class MainActivity extends Activity {
         moveHint.setVisibility(View.GONE);
         root.addView(moveHint, at(px(MARGIN), px(ROW1_TOP - 64), -2, -2));
 
-        setContentView(scroller);
+        stage.addView(scroller, new FrameLayout.LayoutParams(-1, -1));
+        setContentView(stage);
 
         IntentFilter f = new IntentFilter();
         f.addAction(Intent.ACTION_PACKAGE_ADDED);
@@ -177,6 +198,7 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        handler.removeCallbacks(washFade);
         unregisterReceiver(packagesChanged);
         ConnectivityManager cm = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         if (cm != null) try { cm.unregisterNetworkCallback(networkChanged); } catch (Exception ignored) {}
@@ -285,6 +307,8 @@ public class MainActivity extends Activity {
         }
         tiles.clear();
         rowApps.clear();
+        washes.clear(); // an update may bring new art
+        washKey = null;
         movingKey = null;
         moveHint.setVisibility(View.GONE);
 
@@ -405,8 +429,11 @@ public class MainActivity extends Activity {
         }
 
         final boolean glass = banner == null;
+        // Apps tint the glow with their banner's (or icon's) colour; the bottom row leaves it as it is.
+        final Drawable art = !rowApps.contains(key) ? null : banner != null ? banner : appIcon;
         card.setOnFocusChangeListener((v, has) -> {
             if (has) focusedKey = key;
+            if (has && art != null) showWash(key, art);
             if (glass) bg.setColor(has ? 0x38FFFFFF : 0x13FFFFFF);
             v.animate().scaleX(has ? 1.1f : 1f).scaleY(has ? 1.1f : 1f).translationZ(has ? px(26) : 0)
                     .setDuration(140).withLayer().start();
@@ -476,6 +503,91 @@ public class MainActivity extends Activity {
         root.addView(wrap, at(x, px(ICON_TOP), b, b));
         tiles.add(card);
         return iv;
+    }
+
+    // Fades the glow to the focused app's colour. It waits until focus rests for a moment, so
+    // sweeping along a row doesn't fade through every app on the way.
+    private void showWash(String key, Drawable art) {
+        if (key.equals(washKey)) return;
+        washKey = key;
+        Drawable w = washes.get(key);
+        if (w == null) washes.put(key, w = glow(mainColor(art)));
+        washNext = w;
+        handler.removeCallbacks(washFade);
+        handler.postDelayed(washFade, 120);
+    }
+
+    private final Runnable washFade = new Runnable() {
+        @Override public void run() {
+            TransitionDrawable t = new TransitionDrawable(new Drawable[] {
+                    washNow != null ? washNow : new ColorDrawable(Color.TRANSPARENT), washNext});
+            t.setCrossFadeEnabled(true);
+            wash.setImageDrawable(t);
+            t.startTransition(600);
+            washNow = washNext;
+        }
+    };
+
+    // The app's main colour: the hue that most of its strong pixels share, skipping whites, greys
+    // and near-blacks, so a white banner with a red logo gives red. It's then made rich enough to
+    // glow. Art with no strong colour gets the home screen's own warm tone.
+    private int mainColor(Drawable art) {
+        Drawable small = fit(art, 32, 18);
+        if (!(small instanceof BitmapDrawable)) return WARM;
+        Bitmap b = ((BitmapDrawable) small).getBitmap();
+        int[] pix = new int[b.getWidth() * b.getHeight()];
+        b.getPixels(pix, 0, b.getWidth(), 0, 0, b.getWidth(), b.getHeight());
+        final int bins = 24; // 15 degrees of hue each
+        float[] weight = new float[bins], red = new float[bins], green = new float[bins], blue = new float[bins];
+        float[] hsv = new float[3];
+        for (int p : pix) {
+            if ((p >>> 24) < 128) continue;
+            Color.colorToHSV(p, hsv);
+            if (hsv[1] < 0.25f || hsv[2] < 0.2f) continue;
+            int bin = Math.min(bins - 1, (int) (hsv[0] / 360f * bins));
+            float w = hsv[1] * hsv[2]; // vivid pixels count for more
+            weight[bin] += w;
+            red[bin] += w * Color.red(p);
+            green[bin] += w * Color.green(p);
+            blue[bin] += w * Color.blue(p);
+        }
+        int best = 0;
+        for (int i = 1; i < bins; i++) if (weight[i] > weight[best]) best = i;
+        if (weight[best] < 1f) return WARM;
+        float w = weight[best];
+        Color.colorToHSV(Color.rgb((int) (red[best] / w), (int) (green[best] / w), (int) (blue[best] / w)), hsv);
+        hsv[1] = Math.max(0.5f, Math.min(0.85f, hsv[1]));
+        hsv[2] = Math.max(0.75f, Math.min(0.95f, hsv[2]));
+        return Color.HSVToColor(hsv);
+    }
+
+    private static final int WARM = 0xFFFF8048;
+
+    // A dark background lit by one colour: a big glow from the top left, a neighbouring shade
+    // from the right and a faint deep one at the bottom. Gradients only, so it costs no memory.
+    private Drawable glow(int color) {
+        float[] hsv = new float[3];
+        Color.colorToHSV(color, hsv);
+        // The neighbouring shade leans towards purple and pink, never towards a muddy yellow.
+        float shift = hsv[0] >= 60 && hsv[0] < 300 ? 30 : -30;
+        float[] near = {(hsv[0] + shift + 360) % 360, hsv[1], hsv[2] * 0.8f};
+        float[] deep = {(hsv[0] + 340) % 360, Math.min(1f, hsv[1] + 0.1f), hsv[2] * 0.55f};
+        int rgb = color & 0x00FFFFFF;
+        GradientDrawable base = new GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM,
+                new int[] {blend(color, 0xFF050405, 0.82f), 0xFF0A0809, 0xFF050405});
+        GradientDrawable main = radial(0xB3000000 | rgb, 0.12f, -0.15f, px(1350));
+        GradientDrawable side = radial((Color.HSVToColor(near) & 0x00FFFFFF) | 0x80000000, 1.0f, 0.2f, px(1000));
+        GradientDrawable low = radial((Color.HSVToColor(deep) & 0x00FFFFFF) | 0x59000000, 0.55f, 1.15f, px(1100));
+        GradientDrawable[] layers = {base, main, side, low};
+        for (GradientDrawable g : layers) g.setDither(true);
+        return new LayerDrawable(layers);
+    }
+
+    // Mixes a towards b: 0 gives a, 1 gives b.
+    private static int blend(int a, int b, float t) {
+        return Color.rgb(Math.round(Color.red(a) + (Color.red(b) - Color.red(a)) * t),
+                Math.round(Color.green(a) + (Color.green(b) - Color.green(a)) * t),
+                Math.round(Color.blue(a) + (Color.blue(b) - Color.blue(a)) * t));
     }
 
     private void open(String key) {
